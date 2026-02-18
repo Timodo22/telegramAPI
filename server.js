@@ -1,12 +1,12 @@
 const express = require('express');
 const cors = require('cors');
-const { TelegramClient } = require("telegram");
+const { TelegramClient, Api } = require("telegram"); // <--- Api toegevoegd!
 const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // Render gebruikt vaak 10000
 
 // Helper: Pauze functie
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -37,6 +37,8 @@ app.post('/api/search', async (req, res) => {
         console.log(`📡 Query: '${query}' -> @${TARGET_BOT_USERNAME}`);
 
         await client.sendMessage(TARGET_BOT_USERNAME, { message: query });
+        
+        // Wacht even op antwoord
         await sleep(3500); 
 
         let messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
@@ -48,69 +50,58 @@ app.post('/api/search', async (req, res) => {
 
         let fullLog = currentMsg.text;
         let pageCount = 1;
-        const MAX_PAGES = 19; // Jouw screenshot toonde 19 pagina's max
+        const MAX_PAGES = 19; 
 
         // --- LOOP START ---
         while (pageCount < MAX_PAGES) {
             if (currentMsg.buttons) {
                 
-                // DEBUG: Laat zien wat de bot ziet in de console (check Render logs!)
-                console.log(`--- PAGINA ${pageCount} KNOPPEN DEBUG ---`);
-                currentMsg.buttons.forEach((row, i) => {
-                    console.log(`Rij ${i}:`, row.map(b => `[Text: '${b.text}' | Data: ${b.data ? 'Ja' : 'Nee'}]`));
-                });
-
                 let nextButton = null;
 
-                // STRATEGIE 1: Zoek op tekst (meerdere varianten)
+                // 1. Zoek de knop (je logs lieten zien dat '➡' werkt)
                 const allButtons = currentMsg.buttons.flat();
-                const arrowVariations = ["➡️", "➡", "->", ">", "⏩", "Next"];
-                
-                nextButton = allButtons.find(btn => {
-                    // We trimmen de tekst om spaties weg te halen
-                    const cleanText = btn.text.trim();
-                    return arrowVariations.includes(cleanText);
-                });
+                nextButton = allButtons.find(btn => btn.text.includes("➡") || btn.text.includes("➡️"));
 
-                // STRATEGIE 2: Positie-hack (Als tekst faalt)
-                // Op jouw screenshot is de knop ALTIJD de laatste in de eerste rij.
+                // 2. Fallback: pak de laatste knop van de eerste rij als tekst niet matcht
                 if (!nextButton && currentMsg.buttons.length > 0) {
-                    const firstRow = currentMsg.buttons[0];
-                    // Als er 3 knoppen zijn [Terug, Teller, Verder], pak de laatste.
-                    if (firstRow.length === 3) {
-                        console.log("⚠️ Tekst match mislukt, we gebruiken positie-hack (laatste knop rij 1).");
-                        nextButton = firstRow[2]; 
-                    }
-                    // Als er 2 knoppen zijn [Teller, Verder] (bij pagina 1), pak de laatste.
-                    else if (firstRow.length === 2) {
-                         console.log("⚠️ Tekst match mislukt, we gebruiken positie-hack (laatste knop rij 1).");
-                         nextButton = firstRow[1];
-                    }
+                     const row = currentMsg.buttons[0];
+                     nextButton = row[row.length - 1]; 
                 }
 
-                if (nextButton) {
-                    console.log(`➡️ KLIK OP: '${nextButton.text}'`);
+                if (nextButton && nextButton.data) {
+                    console.log(`➡️ KLIK (Manual Invoke) op pagina ${pageCount}`);
                     
-                    await nextButton.click();
-                    
-                    // Wacht op de edit van de bot
+                    // --- DE FIX: HANDMATIGE KLIK ---
+                    // We sturen direct een API request in plaats van de buggy .click() helper
+                    try {
+                        await client.invoke(
+                            new Api.messages.GetBotCallbackAnswer({
+                                peer: TARGET_BOT_USERNAME,
+                                msgId: currentMsg.id,
+                                data: nextButton.data, // De binaire data achter de knop
+                            })
+                        );
+                    } catch (clickErr) {
+                        console.error("Klik error (kan genegeerd worden als pagina update):", clickErr.message);
+                    }
+
+                    // Wacht tot de bot het bericht heeft aangepast (Edit)
+                    // Dit moet lang genoeg zijn, Telegram bots zijn soms traag met editen
                     await sleep(3000); 
 
-                    // Ververs bericht
+                    // Haal bericht opnieuw op
                     messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
                     currentMsg = messages[0];
 
-                    // Check of we niet per ongeluk hetzelfde bericht hebben (soms is bot traag)
-                    // We voegen het alleen toe als het uniek lijkt of gewoon als afscheiding
+                    // Voeg toe aan log
                     fullLog += `\n\n================ PAGE ${pageCount + 1} ================\n` + currentMsg.text;
-                    
                     pageCount++;
+
                 } else {
-                    console.log("⏹️ Geen 'Volgende' knop meer gevonden. Klaar.");
+                    console.log("⏹️ Geen 'Volgende' knop meer. Klaar.");
                     break; 
                 }
             } else {
-                console.log("Geen knoppen meer.");
                 break;
             }
         }
@@ -120,7 +111,7 @@ app.post('/api/search', async (req, res) => {
 
     } catch (error) {
         console.error("❌ Fout:", error);
-        res.status(500).json({ error: "Interne server fout: " + error.message });
+        res.status(500).json({ error: "Interne fout: " + error.message });
     }
 });
 
