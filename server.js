@@ -1,14 +1,13 @@
 const express = require('express');
 const cors = require('cors');
-const { TelegramClient, Api } = require("telegram"); // <--- Api toegevoegd!
+const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 10000; // Render gebruikt vaak 10000
+const PORT = process.env.PORT || 10000;
 
-// Helper: Pauze functie
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 app.use(cors());
@@ -26,7 +25,7 @@ const client = new TelegramClient(new StringSession(sessionString), apiId, apiHa
 (async () => {
     console.log("Verbinden met Telegram...");
     await client.connect();
-    console.log(`✅ Ingelogd! Klaar om te praten met @${TARGET_BOT_USERNAME}`);
+    console.log(`✅ Ingelogd! Klaar voor smart-scraping bij @${TARGET_BOT_USERNAME}`);
 })();
 
 app.post('/api/search', async (req, res) => {
@@ -38,7 +37,7 @@ app.post('/api/search', async (req, res) => {
 
         await client.sendMessage(TARGET_BOT_USERNAME, { message: query });
         
-        // Wacht even op antwoord
+        // Wacht op eerste antwoord
         await sleep(3500); 
 
         let messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
@@ -50,55 +49,78 @@ app.post('/api/search', async (req, res) => {
 
         let fullLog = currentMsg.text;
         let pageCount = 1;
-        const MAX_PAGES = 19; 
+        let maxPages = 1; // Standaard 1 pagina als we niks vinden
 
-        // --- LOOP START ---
-        while (pageCount < MAX_PAGES) {
+        // --- SMART PAGE DETECTION ---
+        if (currentMsg.buttons) {
+            const allButtons = currentMsg.buttons.flat();
+            
+            // Zoek een knop met het patroon "cijfer \ cijfer" of "cijfer / cijfer"
+            // Voorbeeld: "1\19" of "1/10"
+            const counterBtn = allButtons.find(btn => /\d+[\/\\]\d+/.test(btn.text));
+
+            if (counterBtn) {
+                // Haal de getallen eruit
+                const match = counterBtn.text.match(/(\d+)[\/\\](\d+)/);
+                if (match && match[2]) {
+                    maxPages = parseInt(match[2]);
+                    console.log(`📄 Smart Detectie: '${counterBtn.text}' -> We moeten tot pagina ${maxPages} gaan.`);
+                }
+            } else {
+                console.log("⚠️ Geen teller-knop gevonden (bijv 1/19). We pakken alleen deze pagina.");
+            }
+        }
+
+        // Veiligheidslimiet (voor het geval de bot zegt: 1/1000)
+        if (maxPages > 20) {
+            console.log(`⚠️ Limiet overschreden (${maxPages}). We cappen op 20 om timeout te voorkomen.`);
+            maxPages = 20;
+        }
+
+        // --- DE LOOP ---
+        // Hij stopt nu precies wanneer pageCount gelijk is aan maxPages
+        while (pageCount < maxPages) {
+            
             if (currentMsg.buttons) {
-                
                 let nextButton = null;
-
-                // 1. Zoek de knop (je logs lieten zien dat '➡' werkt)
                 const allButtons = currentMsg.buttons.flat();
+                
+                // Zoek de pijl
                 nextButton = allButtons.find(btn => btn.text.includes("➡") || btn.text.includes("➡️"));
 
-                // 2. Fallback: pak de laatste knop van de eerste rij als tekst niet matcht
+                // Fallback (laatste knop rij 1)
                 if (!nextButton && currentMsg.buttons.length > 0) {
                      const row = currentMsg.buttons[0];
                      nextButton = row[row.length - 1]; 
                 }
 
                 if (nextButton && nextButton.data) {
-                    console.log(`➡️ KLIK (Manual Invoke) op pagina ${pageCount}`);
+                    console.log(`➡️ KLIK voor pagina ${pageCount + 1} van ${maxPages}`);
                     
-                    // --- DE FIX: HANDMATIGE KLIK ---
-                    // We sturen direct een API request in plaats van de buggy .click() helper
                     try {
                         await client.invoke(
                             new Api.messages.GetBotCallbackAnswer({
                                 peer: TARGET_BOT_USERNAME,
                                 msgId: currentMsg.id,
-                                data: nextButton.data, // De binaire data achter de knop
+                                data: nextButton.data, 
                             })
                         );
                     } catch (clickErr) {
-                        console.error("Klik error (kan genegeerd worden als pagina update):", clickErr.message);
+                        console.error("Klik warning:", clickErr.message);
                     }
 
-                    // Wacht tot de bot het bericht heeft aangepast (Edit)
-                    // Dit moet lang genoeg zijn, Telegram bots zijn soms traag met editen
-                    await sleep(3000); 
+                    // Wacht op edit
+                    await sleep(2500); 
 
-                    // Haal bericht opnieuw op
+                    // Refresh bericht
                     messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
                     currentMsg = messages[0];
 
-                    // Voeg toe aan log
                     fullLog += `\n\n================ PAGE ${pageCount + 1} ================\n` + currentMsg.text;
                     pageCount++;
 
                 } else {
-                    console.log("⏹️ Geen 'Volgende' knop meer. Klaar.");
+                    console.log("⏹️ Geen volgende knop, terwijl we nog niet klaar waren. Stop.");
                     break; 
                 }
             } else {
@@ -106,7 +128,7 @@ app.post('/api/search', async (req, res) => {
             }
         }
 
-        console.log(`✅ Klaar! Totaal ${pageCount} pagina's.`);
+        console.log(`✅ Klaar! ${pageCount}/${maxPages} pagina's opgehaald.`);
         res.json({ full_text: fullLog });
 
     } catch (error) {
