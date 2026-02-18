@@ -7,15 +7,13 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Helper: Pauze
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Helper om Markdown rommel (** en `) weg te halen
+// Helper: Markdown Cleanen (** en ` weghalen)
 const cleanText = (text) => {
     if (!text) return "";
-    return text
-        .replace(/\*\*/g, '') // Haal vetgedrukte sterretjes weg
-        .replace(/`/g, '')    // Haal code backticks weg
-        .trim();
+    return text.replace(/\*\*/g, '').replace(/`/g, '').trim();
 };
 
 app.use(cors());
@@ -33,65 +31,62 @@ const client = new TelegramClient(new StringSession(sessionString), apiId, apiHa
 (async () => {
     console.log("Verbinden met Telegram...");
     await client.connect();
-    console.log(`✅ Ingelogd! Streaming mode active @${TARGET_BOT_USERNAME}`);
+    console.log(`✅ Ingelogd! Ready for streaming @${TARGET_BOT_USERNAME}`);
 })();
 
-app.post('/api/search', async (req, res) => {
-    const { query } = req.body;
-    
-    // 1. Headers instellen voor STREAMING
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+// LET OP: Dit is nu app.GET geworden voor streaming!
+app.get('/api/stream_search', async (req, res) => {
+    // We halen de query nu uit de URL (?q=...)
+    const query = req.query.q;
+
+    // Headers voor Server-Sent Events (SSE)
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
+    });
 
     if (!query) {
-        res.write(`data: ${JSON.stringify({ type: 'error', message: "Geen query" })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: 'error', message: "Geen query opgegeven" })}\n\n`);
         return res.end();
     }
 
     try {
-        console.log(`📡 Query: '${query}'`);
+        console.log(`📡 Start Stream voor: '${query}'`);
         
-        // Meld aan frontend dat we beginnen
-        res.write(`data: ${JSON.stringify({ type: 'status', message: "Connecting to Telegram Network...", page: 0, total: 0 })}\n\n`);
+        // Direct een signaal sturen zodat de frontend weet dat de verbinding leeft
+        res.write(`data: ${JSON.stringify({ type: 'status', message: "Connecting to Telegram...", page: 0, total: 0 })}\n\n`);
 
         await client.sendMessage(TARGET_BOT_USERNAME, { message: query });
-        await sleep(3500); 
+        await sleep(3000); // Wacht op bot reactie
 
         let messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
         let currentMsg = messages[0];
 
         if (!currentMsg || !currentMsg.text) {
-            res.write(`data: ${JSON.stringify({ type: 'error', message: "Bot reageert niet." })}\n\n`);
+            res.write(`data: ${JSON.stringify({ type: 'error', message: "Geen reactie van bot." })}\n\n`);
             return res.end();
         }
 
         let pageCount = 1;
         let maxPages = 1; 
 
-        // --- SMART PAGE DETECTION ---
+        // Smart Page Detection
         if (currentMsg.buttons) {
             const allButtons = currentMsg.buttons.flat();
             const counterBtn = allButtons.find(btn => /\d+[\/\\]\d+/.test(btn.text));
-
             if (counterBtn) {
                 const match = counterBtn.text.match(/(\d+)[\/\\](\d+)/);
-                if (match && match[2]) {
-                    maxPages = parseInt(match[2]);
-                }
+                if (match && match[2]) maxPages = parseInt(match[2]);
             }
         }
         
-        // Stuur totaal aantal pagina's naar frontend
         res.write(`data: ${JSON.stringify({ type: 'status', message: "Target Locked", page: 1, total: maxPages })}\n\n`);
-
-        // Stuur de EERSTE pagina direct
         res.write(`data: ${JSON.stringify({ type: 'content', text: cleanText(currentMsg.text), page: 1 })}\n\n`);
 
-        // --- DE LOOP (ZONDER LIMIET) ---
-        // Let op: Render Free Tier stopt verbinding na 100 sec, maar we gaan door tot we crashen
+        // Loop
         while (pageCount < maxPages) {
-            
             if (currentMsg.buttons) {
                 let nextButton = null;
                 const allButtons = currentMsg.buttons.flat();
@@ -99,14 +94,14 @@ app.post('/api/search', async (req, res) => {
                 // Zoek pijl
                 nextButton = allButtons.find(btn => btn.text.includes("➡") || btn.text.includes("➡️"));
                 
-                // Fallback
+                // Fallback (laatste knop)
                 if (!nextButton && currentMsg.buttons.length > 0) {
                      const row = currentMsg.buttons[0];
                      nextButton = row[row.length - 1]; 
                 }
 
                 if (nextButton && nextButton.data) {
-                    // Update frontend status
+                    // Update status naar frontend
                     res.write(`data: ${JSON.stringify({ type: 'status', message: `Scraping page ${pageCount + 1}...`, page: pageCount + 1, total: maxPages })}\n\n`);
                     
                     try {
@@ -117,21 +112,15 @@ app.post('/api/search', async (req, res) => {
                                 data: nextButton.data, 
                             })
                         );
-                    } catch (clickErr) {
-                         // negeer klik fouten
-                    }
+                    } catch (e) { /* negeer klik fouten */ }
 
-                    // Iets korter wachten voor snelheid
-                    await sleep(2200); 
+                    await sleep(2200); // Wacht op edit
 
                     messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
                     currentMsg = messages[0];
 
-                    // Stuur het NIEUWE blok tekst naar frontend
                     res.write(`data: ${JSON.stringify({ type: 'content', text: cleanText(currentMsg.text), page: pageCount + 1 })}\n\n`);
-                    
                     pageCount++;
-
                 } else {
                     break; 
                 }
@@ -140,11 +129,11 @@ app.post('/api/search', async (req, res) => {
             }
         }
 
-        res.write(`data: ${JSON.stringify({ type: 'done', message: "Scan Complete" })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: 'done', message: "Scan voltooid" })}\n\n`);
         res.end();
 
     } catch (error) {
-        console.error("Error:", error);
+        console.error("Stream Error:", error);
         res.write(`data: ${JSON.stringify({ type: 'error', message: error.message })}\n\n`);
         res.end();
     }
