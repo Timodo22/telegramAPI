@@ -3,22 +3,22 @@ const cors = require('cors');
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
-const { Button } = require("telegram/tl/custom/button");
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Helper: Even wachten (sleep)
+// Helper: Pauze functie (belangrijk voor Telegram edits)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 app.use(cors());
 app.use(express.json());
 
+// CONFIGURATIE (uit Render Environment)
 const apiId = parseInt(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const sessionString = process.env.TELEGRAM_SESSION; 
-const TARGET_BOT_USERNAME = "DehashedBot"; // Hardcoded voor zekerheid, of gebruik env
+const TARGET_BOT_USERNAME = process.env.TARGET_BOT_USERNAME || "DehashedBot"; 
 
 const client = new TelegramClient(new StringSession(sessionString), apiId, apiHash, {
     connectionRetries: 5,
@@ -27,7 +27,7 @@ const client = new TelegramClient(new StringSession(sessionString), apiId, apiHa
 (async () => {
     console.log("Verbinden met Telegram...");
     await client.connect();
-    console.log(`✅ Ingelogd! Klaar voor actie met @${TARGET_BOT_USERNAME}`);
+    console.log(`✅ Ingelogd! Klaar om te praten met @${TARGET_BOT_USERNAME}`);
 })();
 
 app.post('/api/search', async (req, res) => {
@@ -37,83 +37,69 @@ app.post('/api/search', async (req, res) => {
     try {
         console.log(`📡 Query: '${query}' -> @${TARGET_BOT_USERNAME}`);
 
-        // 1. Stuur bericht
+        // 1. Stuur commando
         await client.sendMessage(TARGET_BOT_USERNAME, { message: query });
 
-        // 2. WACHT STRATEGIE:
-        // De bot stuurt eerst een "Summary" bericht, en DAARNA pas de resultaten.
-        // We wachten even 3 seconden om zeker te zijn dat alle berichten binnen zijn.
-        await sleep(3000); 
+        // 2. Wacht op EERSTE reactie (kan even duren)
+        await sleep(3500); 
 
-        // 3. Haal de laatste berichten op uit de chat
-        const messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 3 });
-        
-        // Zoek het bericht dat de DATA bevat (niet de samenvatting).
-        // De samenvatting bevat vaak "Request:", de data bevat "Email:" of "Password:".
-        let resultMsg = messages.find(m => m.text && (m.text.includes("Email:") || m.text.includes("Password:")));
+        // 3. Haal het laatste bericht op
+        let messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
+        let currentMsg = messages[0];
 
-        // Als we geen data bericht vinden, pakken we gewoon het allerlaatste bericht
-        if (!resultMsg) resultMsg = messages[0];
-
-        if (!resultMsg) {
-            return res.json({ full_text: "Geen resultaten ontvangen van de bot." });
+        if (!currentMsg || !currentMsg.text) {
+            return res.json({ full_text: "Geen antwoord ontvangen van bot." });
         }
 
-        let fullLog = resultMsg.text;
+        // Variabele om alle tekst in op te slaan
+        let fullLog = currentMsg.text;
+        let pageCount = 1;
+        const MAX_PAGES = 15; // Beveiliging: stop na 15 pagina's om vastlopen te voorkomen
 
-        // 4. PAGINATION LOOP (Automatisch bladeren)
-        // We kijken of er knoppen zijn en proberen op '➡️' te klikken.
-        let pageCount = 0;
-        const MAX_PAGES = 5; // Veiligheid: max 5 pagina's ophalen
-
+        // 4. DE LOOP: Klikken op '➡️' tot het op is
         while (pageCount < MAX_PAGES) {
-            if (resultMsg.buttons) {
-                // Zoek de knop met het pijltje naar rechts
-                // Vaak is dit een emoji of specifieke text. In jouw screenshot is het de rechter knop.
-                // We zoeken plat naar een knop die 'Next' of een pijl suggereert in de data, 
-                // maar bij GramJS kunnen we vaak gewoon de componenten scannen.
-                
+            // Check of er knoppen zijn
+            if (currentMsg.buttons) {
                 let nextButton = null;
-                
-                // Doorzoek rijen en knoppen
-                for (const row of resultMsg.buttons) {
-                    for (const btn of row) {
-                        if (btn.text.includes("➡️") || btn.text.includes(">")) {
-                            nextButton = btn;
-                        }
-                    }
-                }
+
+                // Zoek de knop met het pijltje (flat() maakt 1 lijst van alle rijen)
+                const allButtons = currentMsg.buttons.flat();
+                nextButton = allButtons.find(btn => btn.text.includes("➡️") || btn.text.includes(">"));
 
                 if (nextButton) {
-                    console.log(`➡️ Pagina ${pageCount + 1}: Klikken op volgende...`);
+                    console.log(`➡️ Gevonden! Klikken voor pagina ${pageCount + 1}...`);
                     
-                    // Klik op de knop
+                    // KLIK!
                     await nextButton.click();
-                    
-                    // Wacht tot de bot het bericht heeft aangepast (edit)
-                    await sleep(2000); 
 
-                    // Haal het bericht opnieuw op (het is ge-edit in plaats van nieuw verstuurd)
-                    const updatedMsgs = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
-                    resultMsg = updatedMsgs[0];
+                    // CRUCIAAL: Wacht tot de bot de tekst heeft aangepast (Edit)
+                    await sleep(2500); 
+
+                    // Haal het bericht OPNIEUW op (want de tekst is veranderd in Telegram)
+                    // We gebruiken 'limit: 1' omdat het bericht nu bovenaan staat of ge-edit is.
+                    messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
+                    currentMsg = messages[0];
+
+                    // Voeg de nieuwe tekst toe aan onze grote log string
+                    // We voegen een scheidingslijn toe voor de duidelijkheid
+                    fullLog += `\n\n================ PAGE ${pageCount + 1} ================\n` + currentMsg.text;
                     
-                    // Voeg de nieuwe tekst toe aan onze log (met een scheidingslijn)
-                    fullLog += `\n\n--- PAGE ${pageCount + 2} ---\n` + resultMsg.text;
                     pageCount++;
                 } else {
-                    break; // Geen volgende knop meer
+                    console.log("⏹️ Geen 'Volgende' knop meer gevonden. Klaar.");
+                    break; // Stop de loop
                 }
             } else {
-                break; // Geen knoppen überhaupt
+                break; // Geen knoppen meer
             }
         }
 
-        // 5. Stuur ALLES terug als één string
+        console.log(`✅ Klaar! Totaal ${pageCount} pagina's opgehaald.`);
         res.json({ full_text: fullLog });
 
     } catch (error) {
         console.error("❌ Fout:", error);
-        res.status(500).json({ error: "Interne fout bij ophalen data." });
+        res.status(500).json({ error: "Interne server fout: " + error.message });
     }
 });
 
