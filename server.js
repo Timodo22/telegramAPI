@@ -2,13 +2,21 @@ const express = require('express');
 const cors = require('cors');
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const { NewMessage } = require("telegram/events");
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Helper om Markdown rommel (** en `) weg te halen
+const cleanText = (text) => {
+    if (!text) return "";
+    return text
+        .replace(/\*\*/g, '') // Haal vetgedrukte sterretjes weg
+        .replace(/`/g, '')    // Haal code backticks weg
+        .trim();
+};
 
 app.use(cors());
 app.use(express.json());
@@ -25,77 +33,81 @@ const client = new TelegramClient(new StringSession(sessionString), apiId, apiHa
 (async () => {
     console.log("Verbinden met Telegram...");
     await client.connect();
-    console.log(`✅ Ingelogd! Klaar voor smart-scraping bij @${TARGET_BOT_USERNAME}`);
+    console.log(`✅ Ingelogd! Streaming mode active @${TARGET_BOT_USERNAME}`);
 })();
 
 app.post('/api/search', async (req, res) => {
     const { query } = req.body;
-    if (!query) return res.status(400).json({ error: "Geen query" });
+    
+    // 1. Headers instellen voor STREAMING
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    if (!query) {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: "Geen query" })}\n\n`);
+        return res.end();
+    }
 
     try {
-        console.log(`📡 Query: '${query}' -> @${TARGET_BOT_USERNAME}`);
+        console.log(`📡 Query: '${query}'`);
+        
+        // Meld aan frontend dat we beginnen
+        res.write(`data: ${JSON.stringify({ type: 'status', message: "Connecting to Telegram Network...", page: 0, total: 0 })}\n\n`);
 
         await client.sendMessage(TARGET_BOT_USERNAME, { message: query });
-        
-        // Wacht op eerste antwoord
         await sleep(3500); 
 
         let messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
         let currentMsg = messages[0];
 
         if (!currentMsg || !currentMsg.text) {
-            return res.json({ full_text: "Geen antwoord ontvangen van bot." });
+            res.write(`data: ${JSON.stringify({ type: 'error', message: "Bot reageert niet." })}\n\n`);
+            return res.end();
         }
 
-        let fullLog = currentMsg.text;
         let pageCount = 1;
-        let maxPages = 1; // Standaard 1 pagina als we niks vinden
+        let maxPages = 1; 
 
         // --- SMART PAGE DETECTION ---
         if (currentMsg.buttons) {
             const allButtons = currentMsg.buttons.flat();
-            
-            // Zoek een knop met het patroon "cijfer \ cijfer" of "cijfer / cijfer"
-            // Voorbeeld: "1\19" of "1/10"
             const counterBtn = allButtons.find(btn => /\d+[\/\\]\d+/.test(btn.text));
 
             if (counterBtn) {
-                // Haal de getallen eruit
                 const match = counterBtn.text.match(/(\d+)[\/\\](\d+)/);
                 if (match && match[2]) {
                     maxPages = parseInt(match[2]);
-                    console.log(`📄 Smart Detectie: '${counterBtn.text}' -> We moeten tot pagina ${maxPages} gaan.`);
                 }
-            } else {
-                console.log("⚠️ Geen teller-knop gevonden (bijv 1/19). We pakken alleen deze pagina.");
             }
         }
+        
+        // Stuur totaal aantal pagina's naar frontend
+        res.write(`data: ${JSON.stringify({ type: 'status', message: "Target Locked", page: 1, total: maxPages })}\n\n`);
 
-        // Veiligheidslimiet (voor het geval de bot zegt: 1/1000)
-        if (maxPages > 20) {
-            console.log(`⚠️ Limiet overschreden (${maxPages}). We cappen op 20 om timeout te voorkomen.`);
-            maxPages = 20;
-        }
+        // Stuur de EERSTE pagina direct
+        res.write(`data: ${JSON.stringify({ type: 'content', text: cleanText(currentMsg.text), page: 1 })}\n\n`);
 
-        // --- DE LOOP ---
-        // Hij stopt nu precies wanneer pageCount gelijk is aan maxPages
+        // --- DE LOOP (ZONDER LIMIET) ---
+        // Let op: Render Free Tier stopt verbinding na 100 sec, maar we gaan door tot we crashen
         while (pageCount < maxPages) {
             
             if (currentMsg.buttons) {
                 let nextButton = null;
                 const allButtons = currentMsg.buttons.flat();
                 
-                // Zoek de pijl
+                // Zoek pijl
                 nextButton = allButtons.find(btn => btn.text.includes("➡") || btn.text.includes("➡️"));
-
-                // Fallback (laatste knop rij 1)
+                
+                // Fallback
                 if (!nextButton && currentMsg.buttons.length > 0) {
                      const row = currentMsg.buttons[0];
                      nextButton = row[row.length - 1]; 
                 }
 
                 if (nextButton && nextButton.data) {
-                    console.log(`➡️ KLIK voor pagina ${pageCount + 1} van ${maxPages}`);
+                    // Update frontend status
+                    res.write(`data: ${JSON.stringify({ type: 'status', message: `Scraping page ${pageCount + 1}...`, page: pageCount + 1, total: maxPages })}\n\n`);
                     
                     try {
                         await client.invoke(
@@ -106,21 +118,21 @@ app.post('/api/search', async (req, res) => {
                             })
                         );
                     } catch (clickErr) {
-                        console.error("Klik warning:", clickErr.message);
+                         // negeer klik fouten
                     }
 
-                    // Wacht op edit
-                    await sleep(2500); 
+                    // Iets korter wachten voor snelheid
+                    await sleep(2200); 
 
-                    // Refresh bericht
                     messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
                     currentMsg = messages[0];
 
-                    fullLog += `\n\n================ PAGE ${pageCount + 1} ================\n` + currentMsg.text;
+                    // Stuur het NIEUWE blok tekst naar frontend
+                    res.write(`data: ${JSON.stringify({ type: 'content', text: cleanText(currentMsg.text), page: pageCount + 1 })}\n\n`);
+                    
                     pageCount++;
 
                 } else {
-                    console.log("⏹️ Geen volgende knop, terwijl we nog niet klaar waren. Stop.");
                     break; 
                 }
             } else {
@@ -128,15 +140,16 @@ app.post('/api/search', async (req, res) => {
             }
         }
 
-        console.log(`✅ Klaar! ${pageCount}/${maxPages} pagina's opgehaald.`);
-        res.json({ full_text: fullLog });
+        res.write(`data: ${JSON.stringify({ type: 'done', message: "Scan Complete" })}\n\n`);
+        res.end();
 
     } catch (error) {
-        console.error("❌ Fout:", error);
-        res.status(500).json({ error: "Interne fout: " + error.message });
+        console.error("Error:", error);
+        res.write(`data: ${JSON.stringify({ type: 'error', message: error.message })}\n\n`);
+        res.end();
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Server draait op poort ${PORT}`);
+    console.log(`🚀 Streaming Server draait op poort ${PORT}`);
 });
