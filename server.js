@@ -8,13 +8,12 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Helper: Pauze functie (belangrijk voor Telegram edits)
+// Helper: Pauze functie
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 app.use(cors());
 app.use(express.json());
 
-// CONFIGURATIE (uit Render Environment)
 const apiId = parseInt(process.env.TELEGRAM_API_ID);
 const apiHash = process.env.TELEGRAM_API_HASH;
 const sessionString = process.env.TELEGRAM_SESSION; 
@@ -37,13 +36,9 @@ app.post('/api/search', async (req, res) => {
     try {
         console.log(`📡 Query: '${query}' -> @${TARGET_BOT_USERNAME}`);
 
-        // 1. Stuur commando
         await client.sendMessage(TARGET_BOT_USERNAME, { message: query });
-
-        // 2. Wacht op EERSTE reactie (kan even duren)
         await sleep(3500); 
 
-        // 3. Haal het laatste bericht op
         let messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
         let currentMsg = messages[0];
 
@@ -51,50 +46,76 @@ app.post('/api/search', async (req, res) => {
             return res.json({ full_text: "Geen antwoord ontvangen van bot." });
         }
 
-        // Variabele om alle tekst in op te slaan
         let fullLog = currentMsg.text;
         let pageCount = 1;
-        const MAX_PAGES = 15; // Beveiliging: stop na 15 pagina's om vastlopen te voorkomen
+        const MAX_PAGES = 19; // Jouw screenshot toonde 19 pagina's max
 
-        // 4. DE LOOP: Klikken op '➡️' tot het op is
+        // --- LOOP START ---
         while (pageCount < MAX_PAGES) {
-            // Check of er knoppen zijn
             if (currentMsg.buttons) {
+                
+                // DEBUG: Laat zien wat de bot ziet in de console (check Render logs!)
+                console.log(`--- PAGINA ${pageCount} KNOPPEN DEBUG ---`);
+                currentMsg.buttons.forEach((row, i) => {
+                    console.log(`Rij ${i}:`, row.map(b => `[Text: '${b.text}' | Data: ${b.data ? 'Ja' : 'Nee'}]`));
+                });
+
                 let nextButton = null;
 
-                // Zoek de knop met het pijltje (flat() maakt 1 lijst van alle rijen)
+                // STRATEGIE 1: Zoek op tekst (meerdere varianten)
                 const allButtons = currentMsg.buttons.flat();
-                nextButton = allButtons.find(btn => btn.text.includes("➡️") || btn.text.includes(">"));
+                const arrowVariations = ["➡️", "➡", "->", ">", "⏩", "Next"];
+                
+                nextButton = allButtons.find(btn => {
+                    // We trimmen de tekst om spaties weg te halen
+                    const cleanText = btn.text.trim();
+                    return arrowVariations.includes(cleanText);
+                });
+
+                // STRATEGIE 2: Positie-hack (Als tekst faalt)
+                // Op jouw screenshot is de knop ALTIJD de laatste in de eerste rij.
+                if (!nextButton && currentMsg.buttons.length > 0) {
+                    const firstRow = currentMsg.buttons[0];
+                    // Als er 3 knoppen zijn [Terug, Teller, Verder], pak de laatste.
+                    if (firstRow.length === 3) {
+                        console.log("⚠️ Tekst match mislukt, we gebruiken positie-hack (laatste knop rij 1).");
+                        nextButton = firstRow[2]; 
+                    }
+                    // Als er 2 knoppen zijn [Teller, Verder] (bij pagina 1), pak de laatste.
+                    else if (firstRow.length === 2) {
+                         console.log("⚠️ Tekst match mislukt, we gebruiken positie-hack (laatste knop rij 1).");
+                         nextButton = firstRow[1];
+                    }
+                }
 
                 if (nextButton) {
-                    console.log(`➡️ Gevonden! Klikken voor pagina ${pageCount + 1}...`);
+                    console.log(`➡️ KLIK OP: '${nextButton.text}'`);
                     
-                    // KLIK!
                     await nextButton.click();
+                    
+                    // Wacht op de edit van de bot
+                    await sleep(3000); 
 
-                    // CRUCIAAL: Wacht tot de bot de tekst heeft aangepast (Edit)
-                    await sleep(2500); 
-
-                    // Haal het bericht OPNIEUW op (want de tekst is veranderd in Telegram)
-                    // We gebruiken 'limit: 1' omdat het bericht nu bovenaan staat of ge-edit is.
+                    // Ververs bericht
                     messages = await client.getMessages(TARGET_BOT_USERNAME, { limit: 1 });
                     currentMsg = messages[0];
 
-                    // Voeg de nieuwe tekst toe aan onze grote log string
-                    // We voegen een scheidingslijn toe voor de duidelijkheid
+                    // Check of we niet per ongeluk hetzelfde bericht hebben (soms is bot traag)
+                    // We voegen het alleen toe als het uniek lijkt of gewoon als afscheiding
                     fullLog += `\n\n================ PAGE ${pageCount + 1} ================\n` + currentMsg.text;
                     
                     pageCount++;
                 } else {
                     console.log("⏹️ Geen 'Volgende' knop meer gevonden. Klaar.");
-                    break; // Stop de loop
+                    break; 
                 }
             } else {
-                break; // Geen knoppen meer
+                console.log("Geen knoppen meer.");
+                break;
             }
         }
 
-        console.log(`✅ Klaar! Totaal ${pageCount} pagina's opgehaald.`);
+        console.log(`✅ Klaar! Totaal ${pageCount} pagina's.`);
         res.json({ full_text: fullLog });
 
     } catch (error) {
